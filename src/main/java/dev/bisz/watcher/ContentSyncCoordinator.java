@@ -149,8 +149,10 @@ final class ContentSyncCoordinator {
             Path stagingRoot = workingRoot.resolve("staging").resolve(manifest.release());
             Files.createDirectories(stagingRoot);
             Map<ContentManifest.Artifact, Path> staged = new LinkedHashMap<>();
-            for (ContentManifest.Artifact artifact : missing) {
-                Path stagedFile = stageArtifact(http, runtimeRoot, stagingRoot, artifact);
+            for (int artifactIndex = 0; artifactIndex < missing.size(); artifactIndex++) {
+                ContentManifest.Artifact artifact = missing.get(artifactIndex);
+                Path stagedFile = stageArtifact(http, runtimeRoot, stagingRoot, artifact,
+                        artifactIndex + 1, missing.size());
                 staged.put(artifact, stagedFile);
             }
 
@@ -265,7 +267,8 @@ final class ContentSyncCoordinator {
     }
 
     private static Path stageArtifact(HttpClient http, Path runtimeRoot, Path stagingRoot,
-                                      ContentManifest.Artifact artifact) throws Exception {
+                                      ContentManifest.Artifact artifact, int artifactNumber,
+                                      int artifactCount) throws Exception {
         Path relativeDirectory = runtimeRoot.relativize(artifact.directory());
         Path stagingDirectory = stagingRoot.resolve(relativeDirectory).normalize();
         if (!stagingDirectory.startsWith(stagingRoot)) {
@@ -273,8 +276,11 @@ final class ContentSyncCoordinator {
         }
         Files.createDirectories(stagingDirectory);
         Path target = stagingDirectory.resolve(artifact.installedFileName());
+        String progressLabel = "[" + artifactNumber + "/" + artifactCount + "] "
+                + artifact.directoryKey() + "/" + artifact.installedFileName();
         if (Files.isRegularFile(target) && ContentHashing.sha256(target).equals(artifact.hash())) {
             validateModIds(target, artifact);
+            logDownload(progressLabel + " already exists in staging and passed verification");
             return target;
         }
 
@@ -283,9 +289,8 @@ final class ContentSyncCoordinator {
             Path partial = target.resolveSibling(target.getFileName() + ".part");
             Files.deleteIfExists(partial);
             try {
-                WatcherLog.log(WatcherLog.Level.INFO,
-                        "Downloading " + artifact.directoryKey() + "/" + artifact.installedFileName()
-                                + " (attempt " + attempt + "/" + DOWNLOAD_ATTEMPTS + ")");
+                logDownload("Downloading " + progressLabel
+                        + " (attempt " + attempt + "/" + DOWNLOAD_ATTEMPTS + ")");
                 HttpResponse<InputStream> response = sendDownload(http, artifact.downloadUri());
                 if (response.statusCode() < 200 || response.statusCode() >= 300) {
                     try (InputStream ignored = response.body()) {
@@ -293,13 +298,15 @@ final class ContentSyncCoordinator {
                     }
                 }
                 try (InputStream input = response.body(); OutputStream output = Files.newOutputStream(partial)) {
-                    input.transferTo(output);
+                    copyWithProgress(input, output,
+                            response.headers().firstValueAsLong("Content-Length").orElse(-1), progressLabel);
                 }
                 if (!ContentHashing.sha256(partial).equals(artifact.hash())) {
                     throw new IOException("Downloaded content hash does not match " + artifact.hash());
                 }
                 validateModIds(partial, artifact);
                 Files.move(partial, target, StandardCopyOption.REPLACE_EXISTING);
+                logDownload(progressLabel + " downloaded and verified");
                 return target;
             } catch (InterruptedException error) {
                 Files.deleteIfExists(partial);
@@ -313,6 +320,50 @@ final class ContentSyncCoordinator {
         }
         throw new IOException("Could not download " + artifact.downloadUri() + " after " + DOWNLOAD_ATTEMPTS
                 + " attempts", lastError);
+    }
+
+    private static void copyWithProgress(InputStream input, OutputStream output, long contentLength,
+                                         String progressLabel) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        long downloaded = 0;
+        int lastPercentBucket = -1;
+        long nextUnknownLengthReport = 5L * 1024 * 1024;
+        for (int read; (read = input.read(buffer)) != -1;) {
+            output.write(buffer, 0, read);
+            downloaded += read;
+
+            if (contentLength > 0) {
+                int percent = (int) Math.min(100, downloaded * 100 / contentLength);
+                int percentBucket = percent / 10;
+                if (percentBucket > lastPercentBucket) {
+                    lastPercentBucket = percentBucket;
+                    logDownload(progressLabel + " - " + percent + "% ("
+                            + humanBytes(downloaded) + "/" + humanBytes(contentLength) + ")");
+                }
+            } else if (downloaded >= nextUnknownLengthReport) {
+                logDownload(progressLabel + " - " + humanBytes(downloaded) + " downloaded");
+                nextUnknownLengthReport += 5L * 1024 * 1024;
+            }
+        }
+        if (contentLength <= 0 || lastPercentBucket < 10) {
+            logDownload(progressLabel + " - download complete (" + humanBytes(downloaded) + ")");
+        }
+    }
+
+    private static String humanBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        double kibibytes = bytes / 1024.0;
+        if (kibibytes < 1024) {
+            return String.format(java.util.Locale.ROOT, "%.1f KiB", kibibytes);
+        }
+        return String.format(java.util.Locale.ROOT, "%.1f MiB", kibibytes / 1024.0);
+    }
+
+    private static void logDownload(String message) {
+        Watcher.LOGGER.info(message);
+        WatcherLog.log(WatcherLog.Level.INFO, message);
     }
 
     private static void validateModIds(Path file, ContentManifest.Artifact artifact) throws IOException {

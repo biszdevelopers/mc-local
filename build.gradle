@@ -7,6 +7,9 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.zip.ZipFile
+import javax.inject.Inject
+import org.gradle.api.tasks.options.Option
+import org.gradle.process.ExecOperations
 
 plugins {
     id 'eclipse'
@@ -119,8 +122,26 @@ def updaterJar = tasks.register('updaterJar', Jar) {
     }
 }
 
+abstract class DeployBuildTask extends DefaultTask {
+    private String remote
+
+    @Inject
+    abstract ExecOperations getExecOperations()
+
+    @Option(option = 'remote', description = 'Replace and upload .minecraft to user@host:/absolute/path/.minecraft or user@host:~/path/.minecraft.')
+    void setRemote(String remote) {
+        this.remote = remote
+    }
+
+    @Input
+    @Optional
+    String getRemote() {
+        remote
+    }
+}
+
 /** Creates an immutable, SHA-256-addressed snapshot of configured runtime content. */
-tasks.register('deployBuild') {
+tasks.register('deployBuild', DeployBuildTask) {
     group = 'distribution'
     description = 'Publishes configured .minecraft content roots and atomically advances latest.'
 
@@ -130,6 +151,27 @@ tasks.register('deployBuild') {
     outputs.upToDateWhen { false }
 
     doLast {
+        def remoteDeployment = null
+        if (remote != null) {
+            String remoteValue = remote.trim()
+            def remoteMatcher = remoteValue =~ /^((?:[A-Za-z0-9][A-Za-z0-9._-]*@)?(?:[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:.%]+\])):((?:~\/|\/)[A-Za-z0-9._\/-]+)$/
+            if (!remoteMatcher.matches()) {
+                throw new GradleException("Invalid --remote destination '${remoteValue}'. Expected user@host:~/path/.minecraft or user@host:/absolute/path/.minecraft using only safe path characters.")
+            }
+
+            String remoteHost = remoteMatcher.group(1)
+            String remotePath = remoteMatcher.group(2)
+            def remoteSegments = remotePath.split('/').findAll { !it.isBlank() && it != '~' }
+            if (remotePath.contains('//') || remoteSegments.any { it == '.' || it == '..' }
+                    || remoteSegments.empty || remoteSegments.last() != '.minecraft') {
+                throw new GradleException("Refusing --remote destination '${remoteValue}': the normalized destination must end with an exact .minecraft directory and cannot contain '.' or '..' segments.")
+            }
+
+            int finalSeparator = remotePath.lastIndexOf('/')
+            String remoteParent = finalSeparator == 0 ? '/' : remotePath.substring(0, finalSeparator)
+            remoteDeployment = [host: remoteHost, path: remotePath, parent: remoteParent]
+        }
+
         def contentHash = { File sourceFile ->
             def digest = MessageDigest.getInstance('SHA-256')
             sourceFile.withInputStream { input ->
@@ -303,6 +345,51 @@ tasks.register('deployBuild') {
 
         int uniqueArtifacts = artifacts.values().sum(0) { it.size() }
         logger.lifecycle("Published ${uniqueArtifacts} unique artifact(s) from ${sourceFileCount} source file(s): ${releaseDirectory}")
+
+        if (remoteDeployment != null) {
+            def sshOptions = [
+                    '-o', 'BatchMode=yes',
+                    '-o', 'PasswordAuthentication=no',
+                    '-o', 'KbdInteractiveAuthentication=no',
+                    '-o', 'StrictHostKeyChecking=yes'
+            ]
+            def runOpenSsh = { String step, String executable, List<String> arguments, String failureHelp ->
+                logger.lifecycle("${step}: ${remoteDeployment.host}")
+                try {
+                    execOperations.exec {
+                        workingDir sourceRoot.parentFile
+                        commandLine(([executable] + arguments) as List<String>)
+                        standardOutput = System.out
+                        errorOutput = System.err
+                    }
+                } catch (Exception error) {
+                    throw new GradleException("${step} failed. ${failureHelp}", error)
+                }
+            }
+
+            runOpenSsh(
+                    'Checking non-interactive SSH authentication',
+                    'ssh',
+                    sshOptions + [remoteDeployment.host, 'true'],
+                    'Ensure the host is trusted in known_hosts and an authorized SSH key is loaded in ssh-agent.'
+            )
+
+            String replaceCommand = "set -eu; rm -rf -- ${remoteDeployment.path}; mkdir -p -- ${remoteDeployment.parent}"
+            runOpenSsh(
+                    'Replacing remote .minecraft',
+                    'ssh',
+                    sshOptions + [remoteDeployment.host, replaceCommand],
+                    "The remote .minecraft may be unchanged or partially removed; inspect ${remoteDeployment.host}:${remoteDeployment.path} before retrying."
+            )
+
+            runOpenSsh(
+                    'Uploading .minecraft recursively',
+                    'scp',
+                    sshOptions + ['-r', '.minecraft', "${remoteDeployment.host}:${remoteDeployment.parent}/"],
+                    "The old remote .minecraft was removed and the upload may be incomplete; retry deployBuild to replace it with a complete copy."
+            )
+            logger.lifecycle("Remote deployment complete: ${remoteDeployment.host}:${remoteDeployment.path}")
+        }
     }
 }
 

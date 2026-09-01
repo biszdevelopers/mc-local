@@ -28,6 +28,34 @@ The development download host defaults to `127.0.0.1:4748`. The numeric loopback
 .\gradlew.bat deployBuild -PdeployHost=https://downloads.example.com
 ```
 
+### Remote `.minecraft` deployment
+
+To publish the content release locally and then replace a remote runtime directory with the repository's complete `.minecraft` directory, run:
+
+```powershell
+.\gradlew.bat deployBuild --remote admin@123.45.123.45:~/mc-local/.minecraft
+```
+
+The destination must use `user@host:path` OpenSSH syntax, its path must be absolute or start with `~/`, and its final directory must be exactly `.minecraft`. This operation intentionally deletes the remote `.minecraft` before recursively uploading the local directory, so remote-only files are not preserved. A custom SSH port should be configured through an entry in `%USERPROFILE%\.ssh\config` and referenced by its host alias.
+
+Remote deployment is non-interactive and key-only: it will never accept or store an SSH password. The host must already be trusted in `known_hosts`, and the key must be authorized remotely and available through `ssh-agent`. A typical one-time Windows setup is:
+
+```powershell
+ssh-keygen -t ed25519
+ssh admin@123.45.123.45
+Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub" | ssh admin@123.45.123.45 "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
+```
+
+Then, from an elevated PowerShell window, enable the currently disabled Windows agent service once:
+
+```powershell
+Set-Service -Name ssh-agent -StartupType Automatic
+Start-Service ssh-agent
+ssh-add "$env:USERPROFILE\.ssh\id_ed25519"
+```
+
+Unlocking the key with `ssh-add` is normally needed only once per Windows login/session. `deployBuild --remote` first verifies key authentication without modifying the remote host; only after that succeeds does it delete and upload the destination.
+
 ## Content server
 
 Install and run the Express server:

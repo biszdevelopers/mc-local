@@ -106,7 +106,7 @@ function createApp(options = {}) {
 
 if (require.main === module) {
   const host = process.env.HOST || '127.0.0.1';
-  const port = Number.parseInt(process.env.PORT || '4748', 10);
+  const port = Number.parseInt(process.env.PORT || '4750', 10);
   createApp().listen(port, host, () => {
     process.stdout.write(`Minecraft content server listening on http://${host}:${port}\n`);
   });
