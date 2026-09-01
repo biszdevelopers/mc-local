@@ -1,0 +1,7 @@
+# This default is copied to Minecraft's config directory on first launch.
+# Change the generated config/relizc-watcher-server.toml to use the live SMP address.
+[server]
+name = "Relizc SMP"
+address = "localhost:25565"
+content_server = "http://127.0.0.1:4748"
+session_server = "https://session.devwatcher.bisz.dev"
